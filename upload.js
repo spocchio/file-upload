@@ -1,7 +1,8 @@
+var fs = require("fs");
 var http = require("http");
 var url = require("url");
-var multipart = require("multipart");
-var sys = require("sys");
+var multipart = require("./multipart.js");
+var sys = require("util");
 var events = require("events");
 var posix = require("posix");
 var execFile = require('child_process').execFile;
@@ -25,7 +26,7 @@ function printHelp (exitp) {
 
 /* Parse command-line options, first two args are the process.
  */
-for (var i = 0, argv = process.argv, len = argv.length; i < len; i++) {
+for (var i = 2, argv = process.argv, len = argv.length; i < len; i++) {
   switch (argv[i]) {
     case '--help':
     printHelp(true);
@@ -57,6 +58,7 @@ for (var i = 0, argv = process.argv, len = argv.length; i < len; i++) {
   }
 }
 
+console.log('running server on port '+port);
 var server = http.createServer(function(req, res) {
     // Simple path-based request dispatcher
     switch (url.parse(req.url).pathname) {
@@ -85,125 +87,130 @@ server.listen(port);
  * Display upload form
  */
 function display_form(req, res) {
-    res.sendHeader(200, {"Content-Type": "text/html"});
+    res.writeHead(200, {"Content-Type": "text/html"});
 	
 	execFile('find', [ folder ], function(err, stdout, stderr) {
 		var file_list = stdout.split('\n');
 		/* now you've got a list with full path file names */
-		str_files = '<ul>'
-		for (file_ele: file_list){
-			str_files += '<li><a href="/execute?'+ querystring.stringify({query:file_list[file_ele]})+'">'+file_list[file_ele]+'</a></li>';
-			}
-		str_files += '</ul>'
-		res.sendBody(
+		str_files = '<h3>File list</h3><ul>';
+		console.log(file_list)
+		for (var i = 0; i<file_list.length; i++){
+			file_ele=i
+			str_files += '<li><a href="/execute?'+ file_list[file_ele]+'">'+file_list[file_ele]+'</a></li>';
+		}
+		str_files += '</ul><hr/>';
+		res.write(str_files+
 			'<form action="/upload" method="post" enctype="multipart/form-data">'+
 			'<input type="file" name="upload-file">'+
-			'<input type="submit" value="Upload">'+
+			'<input type="submit" value="Upload a file"/>'+
 			'</form>'
 		);
-		res.finish();
-	}
+		res.end();
+	});
 }
 
 /*
- * Write chunk of uploaded file
+ * Create multipart parser to parse given request
  */
-function write_chunk(request, fileDescriptor, chunk, isLast, closePromise) {
-    // Pause receiving request data (until current chunk is written)
-    request.pause();
-    // Write chunk to file
-    sys.debug("Writing chunk");
-    posix.write(fileDescriptor, chunk).addCallback(function() {
-        sys.debug("Wrote chunk");
-        // Resume receiving request data
-        request.resume();
-        // Close file if completed
-        if (isLast) {
-            sys.debug("Closing file");
-            posix.close(fileDescriptor).addCallback(function() {
-                sys.debug("Closed file");
-                
-                // Emit file close promise
-                closePromise.emitSuccess();
-            });
-        }
+function parse_multipart(req) {
+    var parser = multipart.parser();
+
+    // Make parser use parsed request headers
+    parser.headers = req.headers;
+
+    // Add listeners to request, transfering data to parser
+
+    req.addListener("data", function(chunk) {
+        parser.write(chunk);
     });
+
+    req.addListener("end", function() {
+        parser.close();
+    });
+
+    return parser;
 }
-/*
- * Handle file execution
- */
-function execute_file(req, res) {
-	file_name = parse(req.url).query
-	execFile(execute, [ file_name ], function(err, stdout, stderr) {
-	
-	});
-	display_form(req, res);
-	
-}
+
 /*
  * Handle file upload
  */
 function upload_file(req, res) {
     // Request body is binary
-    req.setBodyEncoding("binary");
+    req.setEncoding("binary");
 
     // Handle request as multipart
-    var stream = new multipart.Stream(req);
-    
-    // Create promise that will be used to emit event on file close
-    var closePromise = new events.Promise();
+    var stream = parse_multipart(req);
 
-    // Add handler for a request part received
-    stream.addListener("part", function(part) {
-        sys.debug("Received part, name = " + part.name + ", filename = " + part.filename);
-        
-        var openPromise = null;
+    var fileName = null;
+    var fileStream = null;
 
-        // Add handler for a request part body chunk received
-        part.addListener("body", function(chunk) {
-            // Calculate upload progress
-            var progress = (stream.bytesReceived / stream.bytesTotal * 100).toFixed(2);
-            var mb = (stream.bytesTotal / 1024 / 1024).toFixed(1);
-     
-            sys.debug("Uploading " + mb + "mb (" + progress + "%)");
+    // Set handler for a request part received
+    stream.onPartBegin = function(part) {
+        sys.debug("Started part, name = " + part.name + ", filename = " + part.filename);
 
-            // Ask to open/create file (if not asked before)
-            if (openPromise == null) {
-                sys.debug("Opening file");
-                openPromise = posix.open("./uploads/" + part.filename, process.O_CREAT | process.O_WRONLY, 0600);
-            }
+        // Construct file name
+        fileName = folder+'/' + stream.part.filename;
 
-            // Add callback to execute after file is opened
-            // If file is already open it is executed immediately
-            openPromise.addCallback(function(fileDescriptor) {
-                // Write chunk to file
-                write_chunk(req, fileDescriptor, chunk, 
-                    (stream.bytesReceived == stream.bytesTotal), closePromise);
-            });
+        // Construct stream used to write to file
+        fileStream = fs.createWriteStream(fileName);
+
+        // Add error handler
+        fileStream.addListener("error", function(err) {
+            sys.debug("Got error while writing to file '" + fileName + "': ", err);
         });
-    });
 
-    // Add handler for the request being completed
-    stream.addListener("complete", function() {
-        sys.debug("Request complete");
-
-        // Wait until file is closed
-        closePromise.addCallback(function() {
-            // Render response
-            res.sendHeader(200, {"Content-Type": "text/plain"});
-            res.sendBody("Thanks for playing!");
-            res.finish();
-        
-            sys.puts("\n=> Done");
+        // Add drain (all queued data written) handler to resume receiving request data
+        fileStream.addListener("drain", function() {
+            req.resume();
         });
-    });
+    };
+
+    // Set handler for a request part body chunk received
+    stream.onData = function(chunk) {
+        // Pause receiving request data (until current chunk is written)
+        req.pause();
+
+        // Write chunk to file
+        // Note that it is important to write in binary mode
+        // Otherwise UTF-8 characters are interpreted
+        sys.debug("Writing chunk");
+        fileStream.write(chunk, "binary");
+    };
+
+    // Set handler for request completed
+    stream.onEnd = function() {
+        // As this is after request completed, all writes should have been queued by now
+        // So following callback will be executed after all the data is written out
+        fileStream.addListener("drain", function() {
+            // Close file stream
+            fileStream.end();
+            // Handle request completion, as all chunks were already written
+            upload_complete(res);
+        });
+    };
 }
+
+function upload_complete(res) {
+    sys.debug("Request complete");
+	 display_form(null, res);
+}
+
+
 
 /*
  * Handles page not found error
  */
 function show_404(req, res) {
-    res.sendHeader(404, {"Content-Type": "text/plain"});
-    res.sendBody("You r doing it rong!");
-    res.finish();
+    res.writeHead(404, {"Content-Type": "text/plain"});
+    res.write("You r doing it rong!");
+    res.end();
+}
+
+function execute_file(req, res) {
+	file_name = url.parse(req.url).query
+	execFile(command, [ file_name ], function(err, stdout, stderr) {
+		console.log('eseguito',command,file_name,err,stdout,stderr);
+	});
+	display_form(req, res);
+
 }
